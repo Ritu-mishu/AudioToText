@@ -6,7 +6,10 @@ from io import BytesIO
 from md2pdf.core import md2pdf
 from dotenv import load_dotenv
 from download import download_video_audio, delete_download, MAX_FILE_SIZE, FILE_TOO_LARGE_MESSAGE
-
+from faq_pipeline import build_notes_with_faq
+from notes_builder import build_notes
+from diarization import run_diarization
+from diarize import diarize_audio
 load_dotenv()
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", None)
@@ -185,36 +188,51 @@ def generate_notes_structure(transcript: str, model: str = "meta-llama/llama-4-m
     """
 
     shot_example = """
-"Introduction": "Introduction to the AMA session, including the topic of Groq scaling architecture and the panelists",
-"Panelist Introductions": "Brief introductions from Igor, Andrew, and Omar, covering their backgrounds and roles at Groq",
-"Groq Scaling Architecture Overview": "High-level overview of Groq's scaling architecture, covering hardware, software, and cloud components",
-"Hardware Perspective": "Igor's overview of Groq's hardware approach, using an analogy of city traffic management to explain the traditional compute approach and Groq's innovative approach",
-"Traditional Compute": "Description of traditional compute approach, including asynchronous nature, queues, and poor utilization of infrastructure",
-"Groq's Approach": "Description of Groq's approach, including pre-orchestrated movement of data, low latency, high energy efficiency, and high utilization of resources",
-"Hardware Implementation": "Igor's explanation of the hardware implementation, including a comparison of GPU and LPU architectures"
+{
+"Introduction": "Overview of the talk and key themes",
+"Main Concepts": "Core ideas explained simply and clearly",
+"Examples and Analogies": "Concise examples supporting main concepts",
+"Conclusion": "Summary of takeaways and insights"
 }"""
+
     completion = st.session_state.groq.chat.completions.create(
         model=model,
         messages=[
             {
                 "role": "system",
-                "content": "Write in JSON format:\n\n{\"Title of section goes here\":\"Description of section goes here\",\"Title of section goes here\":\"Description of section goes here\",\"Title of section goes here\":\"Description of section goes here\"}"
+                "content": (
+                    "You are an expert academic summarizer. "
+                    "Generate a well-organized JSON structure for detailed but concise notes. "
+                    "Avoid redundant or repeated topics. Focus on clarity and logical order."
+                ),
             },
             {
                 "role": "user",
-                "content": f"### Transcript {transcript}\n\n### Example\n\n{shot_example}### Instructions\n\nCreate a structure for comprehensive notes on the above transcribed audio. Section titles and content descriptions must be comprehensive. Quality over quantity."
-            }
+                "content": (
+                    f"### Transcript\n{transcript}\n\n"
+                    f"### Example\n{shot_example}\n\n"
+                    "### Instructions\n"
+                    "Create a concise, hierarchical JSON outline for notes on the transcript. "
+                    "Each section should capture the essential points without repetition or over-explaining."
+                ),
+            },
         ],
         temperature=0.3,
         max_tokens=8000,
         top_p=1,
         stream=False,
         response_format={"type": "json_object"},
-        stop=None,
     )
 
     usage = completion.usage
-    statistics_to_return = GenerationStatistics(input_time=usage.prompt_time, output_time=usage.completion_time, input_tokens=usage.prompt_tokens, output_tokens=usage.completion_tokens, total_time=usage.total_time, model_name=model)
+    statistics_to_return = GenerationStatistics(
+        input_time=usage.prompt_time,
+        output_time=usage.completion_time,
+        input_tokens=usage.prompt_tokens,
+        output_tokens=usage.completion_tokens,
+        total_time=usage.total_time,
+        model_name=model,
+    )
 
     return statistics_to_return, completion.choices[0].message.content
 
@@ -224,18 +242,31 @@ def generate_section(transcript: str, existing_notes: str, section: str, model: 
         messages=[
             {
                 "role": "system",
-                "content": "You are an expert writer. Generate comprehensive note content for the section provided based factually on the transcript provided. Do *not* repeat any content from previous sections. Do *not* include the section title/header in your response - only generate the content."
+                "content": (
+                    "You are a skilled academic note writer. "
+                    "Write detailed but concise notes for the provided section. "
+                    "Do NOT repeat phrases or ideas already covered in earlier sections. "
+                    "Avoid unnecessary filler text or paraphrasing. "
+                    "Keep sentences informative and to the point. "
+                    "Focus on clarity, logical flow, and factual correctness."
+                ),
             },
             {
                 "role": "user",
-                "content": f"### Transcript\n\n{transcript}\n\n### Existing Notes\n\n{existing_notes}\n\n### Instructions\n\nGenerate comprehensive note content (without the section title) for this section only based on the transcript: \n\n{section}"
-            }
+                "content": (
+                    f"### Transcript\n{transcript}\n\n"
+                    f"### Existing Notes\n{existing_notes}\n\n"
+                    f"### Instructions\n"
+                    f"Write concise, high-quality notes for the section below. "
+                    f"Do not restate information already written in the existing notes.\n\n"
+                    f"Section: {section}"
+                ),
+            },
         ],
-        temperature=0.3,
+        temperature=0.25,  # slightly lower to reduce verbosity
         max_tokens=8000,
-        top_p=1,
+        top_p=0.9,
         stream=True,
-        stop=None,
     )
 
     for chunk in stream:
@@ -246,7 +277,14 @@ def generate_section(transcript: str, existing_notes: str, section: str, model: 
             if not x_groq.usage:
                 continue
             usage = x_groq.usage
-            statistics_to_return = GenerationStatistics(input_time=usage.prompt_time, output_time=usage.completion_time, input_tokens=usage.prompt_tokens, output_tokens=usage.completion_tokens, total_time=usage.total_time, model_name=model)
+            statistics_to_return = GenerationStatistics(
+                input_time=usage.prompt_time,
+                output_time=usage.completion_time,
+                input_tokens=usage.prompt_tokens,
+                output_tokens=usage.completion_tokens,
+                total_time=usage.total_time,
+                model_name=model,
+            )
             yield statistics_to_return
 
 # Initialize
@@ -451,11 +489,16 @@ try:
 
             try:
                 notes_structure_json = json.loads(notes_structure)
-                notes = NoteSection(structure=notes_structure_json,transcript=transcription_text)
-                
-                if 'notes' not in st.session_state:
-                    st.session_state.notes = notes
 
+                # Add FAQ section to structure
+                notes_structure_json["FAQ"] = ""
+
+                notes = NoteSection(structure=notes_structure_json, transcript=transcription_text)
+
+                st.session_state.notes = notes
+
+
+                # 🚀 Now display everything including FAQ
                 st.session_state.notes.display_structure()
 
                 def stream_section_content(sections):
@@ -476,6 +519,10 @@ try:
                             stream_section_content(content)
 
                 stream_section_content(notes_structure_json)
+                # --- Generate FAQ section ---
+                faq_text, faq_items = build_notes_with_faq(transcription_text)
+                st.session_state.notes.contents["FAQ"] = faq_text
+
             except json.JSONDecodeError:
                 st.error("Failed to decode the notes structure. Please try again.")
 
